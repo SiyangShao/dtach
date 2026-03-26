@@ -88,6 +88,42 @@ write_packet_or_fail(int fd, const struct packet *pkt)
 	}
 }
 
+/* Get the default socket directory path. Uses $DTACH_SOCKET_DIR if set,
+** otherwise /tmp/dtach-<uid>/. Returns a static buffer. */
+static const char *
+get_socket_dir(void)
+{
+	static char dir[256];
+	const char *env;
+
+	env = getenv("DTACH_SOCKET_DIR");
+	if (env && *env)
+	{
+		snprintf(dir, sizeof(dir), "%s", env);
+		return dir;
+	}
+	snprintf(dir, sizeof(dir), "/tmp/dtach-%d", (int)getuid());
+	return dir;
+}
+
+/* Ensure the default socket directory exists. */
+static int
+ensure_socket_dir(void)
+{
+	const char *dir = get_socket_dir();
+	struct stat st;
+
+	if (stat(dir, &st) == 0)
+	{
+		if (S_ISDIR(st.st_mode))
+			return 0;
+		return -1;
+	}
+	if (mkdir(dir, 0700) < 0)
+		return -1;
+	return 0;
+}
+
 static void
 usage()
 {
@@ -99,6 +135,7 @@ usage()
 	       "       dtach -n <socket> <options> <command...>\n"
 	       "       dtach -N <socket> <options> <command...>\n"
 	       "       dtach -p <socket>\n"
+	       "       dtach -l\n"
 	       "Modes:\n"
 	       "  -a\t\tAttach to the specified socket.\n"
 	       "  -A\t\tAttach to the specified socket, or create it if it\n"
@@ -111,6 +148,8 @@ usage()
 	       "\t\t  and have dtach run in the foreground.\n"
 	       "  -p\t\tCopy the contents of standard input to the specified\n"
 	       "\t\t  socket.\n"
+	       "  -l\t\tList currently active sessions in the socket\n"
+	       "\t\t  directory.\n"
 	       "Options:\n"
 	       "  -e <char>\tSet the detach character to <char>, defaults "
 	       "to ^\\.\n"
@@ -121,6 +160,9 @@ usage()
 	       "\t\t   ctrl_l: Send a Ctrl L character to the program.\n"
 	       "\t\t    winch: Send a WINCH signal to the program.\n"
 	       "  -z\t\tDisable processing of the suspend key.\n"
+	       "\nThe socket directory defaults to /tmp/dtach-<uid>/, and\n"
+	       "can be overridden with the DTACH_SOCKET_DIR environment "
+	       "variable.\n"
 	       "\nReport any bugs to <" PACKAGE_BUGREPORT ">.\n",
 		PACKAGE_VERSION, __DATE__, __TIME__);
 	exit(0);
@@ -150,6 +192,10 @@ main(int argc, char **argv)
 		mode = argv[0][1];
 		if (mode == '?')
 			usage();
+		else if (mode == 'l')
+		{
+			return list_main();
+		}
 		else if (mode != 'a' && mode != 'c' && mode != 'n' &&
 			 mode != 'A' && mode != 'N' && mode != 'p')
 		{
@@ -177,6 +223,23 @@ main(int argc, char **argv)
 	}
 	sockname = *argv;
 	++argv; --argc;
+
+	/* If the socket name doesn't contain a '/', treat it as a session
+	** name and place it in the default socket directory. */
+	if (strchr(sockname, '/') == NULL)
+	{
+		static char sockbuf[PATH_MAX];
+		const char *dir = get_socket_dir();
+
+		if (ensure_socket_dir() < 0)
+		{
+			printf("%s: Cannot create socket directory %s: %s\n",
+			       progname, dir, strerror(errno));
+			return 1;
+		}
+		snprintf(sockbuf, sizeof(sockbuf), "%s/%s", dir, sockname);
+		sockname = sockbuf;
+	}
 
 	if (mode == 'p')
 	{
@@ -328,5 +391,91 @@ main(int argc, char **argv)
 			return attach_main(0);
 		}
 	}
+	return 0;
+}
+
+/* List active dtach sessions in the socket directory. */
+int
+list_main(void)
+{
+	const char *dir;
+	DIR *d;
+	struct dirent *ent;
+	char path[PATH_MAX];
+	struct stat st;
+	int found = 0;
+
+	if (ensure_socket_dir() < 0)
+	{
+		printf("%s: Cannot access socket directory: %s\n",
+		       progname, strerror(errno));
+		return 1;
+	}
+
+	dir = get_socket_dir();
+	d = opendir(dir);
+	if (!d)
+	{
+		printf("%s: %s: %s\n", progname, dir, strerror(errno));
+		return 1;
+	}
+
+	while ((ent = readdir(d)) != NULL)
+	{
+		int s;
+		struct sockaddr_un sockun;
+		const char *status;
+
+		if (ent->d_name[0] == '.')
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+
+		if (stat(path, &st) < 0)
+			continue;
+		if (!S_ISSOCK(st.st_mode))
+			continue;
+
+		/* Try to connect to see if the session is alive. */
+		if (strlen(path) > sizeof(sockun.sun_path) - 1)
+			continue;
+
+		s = socket(PF_UNIX, SOCK_STREAM, 0);
+		if (s < 0)
+			continue;
+		sockun.sun_family = AF_UNIX;
+		strcpy(sockun.sun_path, path);
+		if (connect(s, (struct sockaddr *)&sockun, sizeof(sockun)) == 0)
+		{
+			close(s);
+			if (st.st_mode & S_IXUSR)
+				status = "(Attached)";
+			else
+				status = "(Detached)";
+		}
+		else
+		{
+			close(s);
+			/* Stale socket - clean it up. */
+			unlink(path);
+			continue;
+		}
+
+		if (!found)
+		{
+			printf("%-30s %-10s\n", "Socket", "Status");
+			printf("%-30s %-10s\n", "------", "------");
+		}
+		printf("%-30s %s\n", ent->d_name, status);
+		found++;
+	}
+	closedir(d);
+
+	if (!found)
+		printf("No sessions in %s\n", dir);
+	else
+		printf("\n%d session%s in %s\n", found,
+		       found == 1 ? "" : "s", dir);
+
 	return 0;
 }

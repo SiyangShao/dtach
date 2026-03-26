@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            cc: gcc
+            cflags: "-O2"
+            ldflags: "-static"
+          - arch: aarch64
+            cc: aarch64-linux-gnu-gcc
+            cflags: "-O2"
+            ldflags: "-static"
+            configure_host: "--host=aarch64-linux-gnu"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          CC=${{ matrix.cc }} CFLAGS="${{ matrix.cflags }}" LDFLAGS="${{ matrix.ldflags }}" ./configure ${{ matrix.configure_host }}
+          make
+          mv dtach dtach-linux-${{ matrix.arch }}
+
+      - name: Verify static binary
+        run: |
+          file dtach-linux-${{ matrix.arch }}
+          # Ensure it's statically linked (no dynamic interpreter)
+          ! readelf -l dtach-linux-${{ matrix.arch }} 2>/dev/null | grep -q INTERP || \
+            (echo "WARNING: binary has dynamic interpreter" && exit 1)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dtach-linux-${{ matrix.arch }}
+          path: dtach-linux-${{ matrix.arch }}
+
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            cflags: "-O2 -target x86_64-apple-macos11"
+          - arch: arm64
+            cflags: "-O2 -target arm64-apple-macos11"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          CFLAGS="${{ matrix.cflags }}" LDFLAGS="-target ${{ matrix.arch }}-apple-macos11" ./configure
+          make
+          mv dtach dtach-macos-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dtach-macos-${{ matrix.arch }}
+          path: dtach-macos-${{ matrix.arch }}
+
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir release
+          for dir in artifacts/*/; do
+            cp "$dir"/* release/
+          done
+          chmod +x release/*
+          cd release && sha256sum * > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

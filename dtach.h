@@ -33,6 +33,7 @@
 #include <config.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -84,6 +85,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 #ifndef S_ISREG
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
@@ -145,6 +147,7 @@ void write_packet_or_fail(int fd, const struct packet *pkt);
 int attach_main(int noerror);
 int master_main(char **argv, int waitattach, int dontfork);
 int push_main(void);
+int list_main(void);
 
 #ifdef sun
 #define BROKEN_MASTER
